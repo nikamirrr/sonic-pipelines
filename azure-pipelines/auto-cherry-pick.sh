@@ -34,22 +34,44 @@ check_conflict(){
         newpr_base="$ORG/$REPO"
     fi
     git remote update
+    git fetch head $PR_BASE_BRANCH --depth=100
     git status
     git checkout -b $PR_BASE_BRANCH --track head/$PR_BASE_BRANCH
     git status
     if [[ "$PR_MERGED" == "true" ]];then
-        git reset $PR_COMMIT_SHA --hard
-        git reset HEAD~
-        git add . -f
+        # PR_COMMIT_SHA from the webhook (merge_commit_sha) is GitHub's ephemeral
+        # test-merge object, which is deleted after a squash merge. Fetch the real
+        # post-merge commit from the GitHub API instead.
+        REAL_SHA=$(gh api repos/$ORG/$REPO/pulls/$PR_NUMBER --jq .merge_commit_sha)
+        git fetch head $REAL_SHA
+        git reset $REAL_SHA --hard
+        # Preserve the merged commit's index, including uninitialized submodule
+        # gitlinks, while moving HEAD back to its parent.
+        git reset HEAD~ --soft
+        if git diff --cached --quiet; then
+            gh pr comment "$PR_URL" --body \
+                "The merged commit contains no changes, so the original PR patch cannot be verified against $branch_label. No cherry-pick PR or included label was created. Please verify the target branch manually."
+            return 250
+        fi
     else
         git fetch head +refs/pull/$PR_NUMBER/merge:refs/remotes/pull/$PR_NUMBER/merge
         git merge pull/$PR_NUMBER/merge --squash || { echo "PR is Out of Date!"; return 253; }
+    fi
+    # A submodule is represented by Git mode 160000. Inspect only the staged PR
+    # patch, not its commit history, which may contain unrelated submodule changes.
+    if git diff --cached --raw | awk '$1 == ":160000" || $2 == "160000" { found=1 } END { exit !found }'; then
+        echo "PR contains submodule change"
+        gh pr comment $PR_URL --body "Auto cherry pick doesn't support submodule update. Please manually cherry pick!"
+        return 251
     fi
     content=$(gh pr view $PR_URL --json title,body)
     title=$(echo "$content" | jq .title -r)
     body=$(echo "$content" | jq .body -r)
     git status
-    git commit -m "$title" -m "$body"
+    if ! git commit --signoff -m "$title" -m "$body"; then
+        echo "Failed to create a commit containing PR #$PR_NUMBER changes."
+        return 255
+    fi
     git status
     commit=$(git log -n 1 --format=%H)
     target_branch=$(echo $branch_label | grep -Eo [0-9]*)
@@ -61,6 +83,16 @@ check_conflict(){
         sleep 1
         return 0
     else
+        if [[ "$PR_MERGED" == "true" ]] && git diff --quiet && git diff --cached --quiet && [[ -z "$(git ls-files -u)" ]]; then
+            git cherry-pick --abort
+            included_label=$(gh label list -R "$ORG/$REPO" --json name --jq '.[].name' | grep -iE "^Included in $branch_label [Bb]ranch$" | head -n1 || true)
+            [[ -z "$included_label" ]] && included_label="Included in $branch_label Branch"
+            gh pr edit $PR_URL --remove-label "Cherry Pick Conflict_$branch_label" || true
+            gh pr edit $PR_URL --add-label "$included_label"
+            gh pr comment $PR_URL --body "No cherry-pick PR is needed for $branch_label because these changes are already present in the target branch. Added the \`$included_label\` label."
+            sleep 1
+            return 250
+        fi
         gh pr edit $PR_URL --add-label "Cherry Pick Conflict_$branch_label" || true
         sleep 1
         return 254
@@ -68,7 +100,11 @@ check_conflict(){
 }
 
 create_pr(){
-    check_conflict "$1"
+    check_conflict "$1" || {
+        check_rc=$?
+        [[ "$check_rc" -eq 250 ]] && return 0
+        return "$check_rc"
+    }
     [[ "$PR_MERGED" != "true" ]] && echo "PR not merged!" && return 0
     git status
     git push mssonicbld HEAD:cherry/$branch_label/$PR_NUMBER -f
@@ -79,7 +115,7 @@ create_pr(){
     echo $result | grep "already exists" && return 0 || true
     new_pr_url=$(echo $result | grep -Eo https://github.com.*)
     gh pr comment $new_pr_url --body "Original PR: $PR_URL"
-    echo $new_pr_url | grep 'github.com/Azure' && sleep 1 && gh pr comment $new_pr_url --body "/azp run"
+    echo $new_pr_url | grep 'github.com/Azure' && sleep 10 && gh pr comment $new_pr_url --body "/azp run"
     sleep 1
     gh pr edit $PR_URL --add-label "Created PR to $branch_label Branch"
     sleep 1
@@ -93,6 +129,16 @@ labeled(){
         echo $ACTION_LABEL | grep msft- || return 0
     fi
     if echo $ACTION_LABEL | grep -E '^Approved for (msft-)?[0-9]{6} Branch$'; then
+        release_owner_key=$(echo $ACTION_LABEL | grep -Eo "[0-9]{6}")
+        release_team="release-manager-$release_owner_key"
+        if gh api "orgs/$ORG/teams/$release_team" &>/dev/null; then
+            if ! gh api "orgs/$ORG/teams/$release_team/memberships/$ACTION_SENDER" --jq '.state' 2>/dev/null | grep -q "^active$"; then
+                gh pr edit $PR_URL --remove-label "$ACTION_LABEL"
+                members=$(gh api "orgs/$ORG/teams/$release_team/members" --jq '.[].login' 2>/dev/null | grep -vxF 'mssonicbld' | sed 's/^/@/' | tr '\n' ' ')
+                gh pr comment $PR_URL --body "The label \`$ACTION_LABEL\` can only be added by a member of the @${ORG}/${release_team} team. Removing the label. Please contact one of the release managers: ${members}to approve the cherry pick."
+                return 0
+            fi
+        fi
         create_pr "$ACTION_LABEL"
         return $?
     fi

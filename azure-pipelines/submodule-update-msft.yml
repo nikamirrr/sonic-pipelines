@@ -1,3 +1,4 @@
+# sonic-buildimage-msft update submodule ref.
 pr: none
 trigger: none
 
@@ -33,6 +34,7 @@ steps:
       for branch in $branches; do
         cd $work_space
         paths=$(cat ../azure-pipelines/codesync.json | jq -r ".\"$branch\"")
+        [ -z "$paths" ] && continue
         git submodule deinit -f --all
         rm .git/modules/* -rf
         git reset HEAD --hard
@@ -48,12 +50,17 @@ steps:
           cd $work_space/$path
           # 1. only keep repos with msft
           git remote -vv
-          git remote -vv | grep -i '\.msft' || continue
-          # 2. only update the same branch with sonic-buildimage-msft
-          git branch -a --contains HEAD | grep "remotes/origin/$branch" || continue
+          module_branch=$branch
+          if [[ "$branch" == "202608" && "$path" == "src/sonic-redfish" ]]; then
+            module_branch=master
+          else
+            git remote -vv | grep -i '\.msft' || continue
+          fi
+          # 2. only update when the current commit belongs to the source branch
+          git branch -a --contains HEAD | grep "remotes/origin/$module_branch" || continue
 
           head=$(git rev-parse HEAD)
-          git checkout $branch
+          git checkout $module_branch
           git pull
           commits=$(git log ${head}..HEAD --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)[%an]%Creset')
           if [[ "$commits" != "" ]];then
@@ -73,8 +80,7 @@ steps:
             git status
             result=$(gh pr create -R Azure/sonic-buildimage-msft -H mssonicbld:submodule-$branch-$module_name -B $branch -t "[submodule][$branch] Update submodule $module_name to the latest HEAD automatically" -l "automerge" -b "$body" 2>&1 || true)
             pr_url=$(echo "$result" | grep -Eo "https://github.com/Azure/sonic-buildimage-msft/pull/[0-9]*")
-            sleep 1
-            gh pr comment $pr_url --body "/azp run"
+            sleep 10
             git reset HEAD~ --hard
             sleep 10
           fi

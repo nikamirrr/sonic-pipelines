@@ -1,3 +1,4 @@
+# code sync for submodules: sonic-net/* -> Azure/sonic-*.msft
 pr: none
 trigger: none
 
@@ -20,6 +21,7 @@ steps:
       repos=$(for i in $(cat azure-pipelines/codesync.json | jq .[] -r); do echo $i | sed 's#src/##'; done | sort -u)
       [ -z $repos ] && exit 1
       for repo in $repos; do
+        [[ "$repo" == "sonic-redfish" ]] && continue
         sudo rm -rf $repo
         git clone https://github.com/sonic-net/$repo
         cd $repo
@@ -38,13 +40,21 @@ steps:
       repos=$(for i in $(cat azure-pipelines/codesync.json | jq .[] -r); do echo $i | sed 's#src/##'; done | sort -u)
       cur_dir=$(pwd)
       sudo rm -rf $cur_dir/log
+      sudo rm -rf $cur_dir/conflicts.jsonl
       for repo in $repos; do
+        [[ "$repo" == "sonic-redfish" ]] && continue
         [ -d $cur_dir/$repo ] || continue
         cd $cur_dir/$repo
         echo "# $repo" | tee -a $cur_dir/log
         branches=$(cat ../azure-pipelines/codesync.json | jq -r keys[])
         for branch in $branches; do
-          if cat ../azure-pipelines/codesync.json | jq -r ".\"$branch\"" | grep -v $repo; then
+          if [[ ",${SKIP_BRANCHES//[[:space:]]/}," == *",$branch,"* ]]; then
+            echo "======Skipping code sync for $branch======"
+            continue
+          fi
+          branch_repos=$(cat ../azure-pipelines/codesync.json | jq -r ".\"$branch\"")
+          [ -z "$branch_repos" ] && continue
+          if echo "$branch_repos" | grep -v $repo; then
             continue
           fi
           branch_base=$branch
@@ -53,6 +63,9 @@ steps:
           if [[ $branch == "202412" ]]; then
             branch_head=202411
           fi
+          if [[ $branch == "kubesonic" ]]; then
+            branch_head=master
+          fi
           if [[ $branch == "202503" ]]; then
             continue # Stop code sync from 202412 to 202503
           fi
@@ -60,9 +73,46 @@ steps:
             echo $branches_202506 | grep $repo || continue
             branch_head=202505
           fi
+          if [[ $branch == "202603" ]]; then
+            branch_head=202511
+          fi
+          if [[ $branch == "202511_azd" ]]; then
+            branch_head=202511
+          fi
+          if [[ $branch == "202512" ]]; then
+            branch_head=202511
+          fi
+          if [[ $branch == "202606" ]]; then
+            branch_head=202605
+          fi
+          if [[ $branch == "202601" ]]; then
+            branch_head=202511
+          fi
+          if [[ $branch == "202607" ]]; then
+            branch_head=202605
+          fi
+          if [[ $branch == "202608" ]]; then
+            branch_head=202605
+          fi
           echo "- $branch" | tee -a $cur_dir/log
-          git ls-remote --exit-code $origin refs/heads/$branch_head || { echo "  - no branch: $origin" | tee -a $cur_dir/log; continue; }
-          git ls-remote --exit-code base refs/heads/$branch_base || { echo "  - no branch: base" | tee -a $cur_dir/log; continue; }
+          rc=0
+          git ls-remote --exit-code $origin refs/heads/$branch_head || rc=$?
+          if [[ $rc -ne 0 ]]; then
+            if [[ $rc -eq 2 ]]; then
+              echo "  - no branch: $origin" | tee -a $cur_dir/log
+              continue
+            fi
+            exit $rc
+          fi
+          rc=0
+          git ls-remote --exit-code base refs/heads/$branch_base || rc=$?
+          if [[ $rc -ne 0 ]]; then
+            if [[ $rc -eq 2 ]]; then
+              echo "  - no branch: base" | tee -a $cur_dir/log
+              continue
+            fi
+            exit $rc
+          fi
           head_commit=$(git log -n 1 --format=%H $origin/$branch_head)
           git log --format=%H base/$branch_base | grep $head_commit && continue
           git merge --abort || true
@@ -74,12 +124,26 @@ steps:
           git clean -xdff
           git status | grep "^nothing to commit, working tree clean" || { echo "  - git not clean" | tee -a $cur_dir/log; continue; }
           prehead=$(git log -n 1 --pretty=format:'%H')
-          git pull $origin $branch_head --no-edit || true
+          pull_rc=0
+          git pull $origin $branch_head --no-edit || pull_rc=$?
           git status
-          if git status | grep "You have unmerged paths";then
+          unmerged_paths=$(git diff --name-only --diff-filter=U)
+          if [[ -n "$unmerged_paths" ]]; then
             echo "  - conflict!" | tee -a $cur_dir/log
+            echo "$unmerged_paths"
+            repo_name="Azure/$repo.msft"
+            jq -cn \
+              --arg repo "$repo_name" \
+              --arg branch "$branch_base" \
+              --arg commit "$head_commit" \
+              --arg upstream_repo "sonic-net/$repo" \
+              --arg upstream_branch "$branch_head" \
+              '{repo: $repo, branch: $branch, commit: $commit, upstream_repo: $upstream_repo, upstream_branch: $upstream_branch}' >> $cur_dir/conflicts.jsonl
             git merge --abort
             continue
+          fi
+          if [[ $pull_rc -ne 0 ]]; then
+            exit $pull_rc
           fi
           head=$(git log -n 1 --pretty=format:'%H')
           if [[ $prehead == $head ]];then
@@ -93,10 +157,22 @@ steps:
           # push code
           git push https://mssonicbld:$TOKEN@github.com/mssonicbld/$repo.msft HEAD:sonicbld/$branch-merge -f
           # craete PR
-          url_=$(gh pr create -R Azure/$repo.msft -H mssonicbld:sonicbld/$branch-merge -B $branch_base -t "[code sync] Merge code from sonic-net/$repo:$branch_head to $branch" -b "$body" -l automerge 2>&1; rc=$?)
-          url=$(echo "$url_" | grep -Eo https://github.com/Azure/$repo.msft/pull/[0-9]* )
-          if echo $url_ | grep "already exists:"; then
-            gh pr edit $url -b "$body" --add-label automerge
+          rc=0
+          url_=$(gh pr create -R Azure/$repo.msft -H mssonicbld:sonicbld/$branch-merge -B $branch_base -t "[code sync] Merge code from sonic-net/$repo:$branch_head to $branch" -b "$body" -l automerge 2>&1) || rc=$?
+          if [[ $rc -ne 0 ]] && ! echo "$url_" | grep -q "already exists"; then
+            echo "$url_"
+            exit $rc
+          fi
+          url=$(echo "$url_" | grep -Eo https://github.com/Azure/$repo.msft/pull/[0-9]* || true)
+          if [[ -z "$url" ]]; then
+            echo "$url_"
+            exit 1
+          fi
+          if echo "$url_" | grep -q "already exists:"; then
+            pr_number=${url##*/}
+            gh api --method PATCH repos/Azure/$repo.msft/pulls/$pr_number -f body="$body"
+            jq -cn '{labels: ["automerge"]}' |
+              gh api --method POST repos/Azure/$repo.msft/issues/$pr_number/labels --input - --silent
           fi
           echo "  - $url" >> $cur_dir/log
           sleep 10
@@ -108,15 +184,28 @@ steps:
   - bash: |
       set -ex
       cat log
-      body="
-      https://dev.azure.com/mssonic/build/_build?definitionId=862\n
-      $(cat log)
-      "
       if grep -q '  - conflict!' log; then
-        curl $URL -H 'Content-Type: application/json' -d "{\"text\": \"$body\"}"
-        exit 1
+        set +x
+        printf '%s' "$CERT" | base64 -d > cert.pfx
+        cert=$(openssl pkcs12 -in cert.pfx -nokeys -nodes -passin pass: | openssl x509 -noout -fingerprint -sha1 | sed 's/^.*=//' | tr -d ':' | tr 'A-Z' 'a-z')
+        rm -f cert.pfx
+        while IFS= read -r conflict; do
+          payload=$(echo "$conflict" | jq \
+            --arg name "code_conflict" \
+            --arg client "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)" \
+            '. + {name: $name, client: $client}')
+          response=$(curl --fail-with-body --silent --show-error \
+            -H 'Content-Type: application/json' \
+            -H "thumbprint: $cert" \
+            -X POST https://notice-center.azurewebsites.net/noti_center/notice \
+            -d "$payload")
+          echo "$response" | jq -e '.success == true'
+        done < conflicts.jsonl
+        set -x
+        echo "##vso[task.logissue type=warning]Submodule code sync conflicts detected"
+        echo "##vso[task.complete result=SucceededWithIssues;]Submodule code sync completed with merge conflicts"
       fi
       exit 0
     env:
-      URL: $(TEAMS-MSG-URL)
+      CERT: $(cert-noti)
     displayName: show result and send alert

@@ -7,12 +7,30 @@ DEFAULT_ARCH=$(dpkg --print-architecture)
 [ -z "$ARCH" ] && [ -f /etc/docker-arch ] && ARCH=$(cat /etc/docker-arch)
 [ -z "$ARCH" ] && ARCH=$DEFAULT_ARCH  
 
+# Avoid slow Azure Ubuntu mirror downloads on amd64 hosts.
+if [ "$DEFAULT_ARCH" == "amd64" ]; then
+  for source in /etc/apt/sources.list \
+                /etc/apt/sources.list.d/*.list \
+                /etc/apt/sources.list.d/*.sources; do
+    if [ -f "$source" ]; then
+      sed -i \
+        's|://azure\.archive\.ubuntu\.com/ubuntu|://archive.ubuntu.com/ubuntu|g' \
+        "$source"
+    fi
+  done
+fi
+
 dpkg --configure -a
 apt-get update
+DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+  apt-get upgrade -y --with-new-pkgs \
+  -o Dpkg::Options::="--force-confdef" \
+  -o Dpkg::Options::="--force-confold"
 apt-get install -y ca-certificates curl gnupg lsb-release
 # install git lfs
 curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | bash
 apt-get install -y git-lfs acl
+apt-get install -y libnftables1 nftables
 
 if [ "$ARCH" == "armhf" ] && [ "$ARCH" != "$DEFAULT_ARCH" ]; then
   dpkg --add-architecture armhf
@@ -25,7 +43,21 @@ echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.gpg] https://download.d
 apt-get update
 #apt-get install -y docker-ce:$ARCH docker-ce-cli:$ARCH containerd.io:$ARCH docker-compose-plugin:$ARCH
 # docker-ce 29 docker root don't work.
-apt-get install -y docker-ce:=5:28.5.2-1~ubuntu.24.04~noble docker-ce-cli=5:28.5.2-1~ubuntu.24.04~noble containerd.io:$ARCH docker-compose-plugin:$ARCH
+# containerd 2.2.1 can't download, pin to 2.2.0
+apt-get install -y --allow-downgrades docker-ce=5:28.5.2-1~ubuntu.24.04~noble docker-ce-cli=5:28.5.2-1~ubuntu.24.04~noble containerd.io=2.2.0-2~ubuntu.24.04~noble docker-compose-plugin:$ARCH
+
+if [ "$ARCH" == "amd64" ]; then
+  # On amd64, reduce the number of random bits for ASLR to 28 from 32. This was
+  # a change done in recent kernels to increase security, but this breaks older
+  # versions of ASAN that assumed that ASLR is only randomizing library load
+  # addresses within a certain range. This can be removed when we are using
+  # newer versions of ASAN that are bundled with GCC (Trixie and newer? Unsure
+  # on this at this time).
+  #
+  # See also https://stackoverflow.com/a/78302537 and https://stackoverflow.com/a/77895910
+  echo "vm.mmap_rnd_bits = 28" > /etc/sysctl.d/99-sonic-mmap-rnd-bits.conf
+  sysctl -p /etc/sysctl.d/99-sonic-mmap-rnd-bits.conf
+fi
 
 # Customize for armhf
 if [ "$ARCH" == "armhf" ] && [ "$ARCH" != "$DEFAULT_ARCH" ]; then
@@ -67,7 +99,18 @@ dpkg -i packages-microsoft-prod.deb
 rm packages-microsoft-prod.deb
 apt-get update
 echo "intnfs.file.core.windows.net:/intnfs/nfs /nfs aznfs noauto,x-systemd.automount,_netdev,vers=4.1,sec=sys,nconnect=4 0 0" >> /etc/fstab
-apt-get install -y build-essential aznfs nfs-common python3-pip python3-setuptools python3-pip python-is-python3
-pip3 install jinjanator --break-system-packages
+apt-get install -y build-essential aznfs nfs-common python3-setuptools python-is-python3
+# Some job need pwsh, Job Validation/Release Task Validation
+if [ "$ARCH" == "amd64" ]; then
+  apt-get install -y powershell
+else
+  mkdir -p /opt/microsoft/powershell/7
+  wget https://github.com/PowerShell/PowerShell/releases/download/v7.5.10/powershell-7.5.10-linux-arm64.tar.gz
+  tar -xzf powershell-7.5.10-linux-arm64.tar.gz -C /opt/microsoft/powershell/7
+  ln -s /opt/microsoft/powershell/7/pwsh /usr/bin/pwsh
+  chmod +x /opt/microsoft/powershell/7/pwsh
+  pwsh -v
+fi
+curl -LsSf https://astral.sh/uv/0.13.0/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh
+UV_TOOL_DIR=/opt/uv/tools UV_TOOL_BIN_DIR=/usr/local/bin uv tool install jinjanator
 mkdir -p /nfs
-
